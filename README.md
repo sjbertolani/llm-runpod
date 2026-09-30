@@ -3,6 +3,8 @@
 Launch an arbitrary Hugging Face LLM on a Runpod GPU pod and expose it as an
 OpenAI-compatible API you can point coding-agent tooling at.
 
+Background: [Own your LLM workflow](https://medium.com/@steve.bertolani/own-your-llm-workflow-6d0088ee7a76)
+
 The default model is:
 
 ```text
