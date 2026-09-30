@@ -72,7 +72,12 @@ def roo_json(connection: VSCodeConnection) -> str:
                 "Base URL": connection.base_url,
                 "API Key": connection.api_key,
                 "Model ID": connection.model,
+                "Context Window": "Match vLLM --max-model-len, e.g. 16384 or 32768",
+                "Max Output": "1024",
+                "Supports Images": "false unless the served model is multimodal",
+                "Prompt Caching": "false unless the endpoint explicitly supports it",
             },
+            "custom_instructions_command": "llm-runpod roo-instructions",
         },
         indent=2,
     )

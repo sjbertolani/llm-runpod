@@ -18,7 +18,7 @@ from llm_runpod.config import (
     default_name,
     env,
 )
-from llm_runpod.openai_client import chat
+from llm_runpod.openai_client import chat, chat_completion, list_models
 from llm_runpod.runpodctl import (
     build_pod_create_command,
     build_volume_create_command,
@@ -28,6 +28,16 @@ from llm_runpod.runpodctl import (
     run_command,
     wait_for_openai_ready,
 )
+from llm_runpod.skills import (
+    all_skills,
+    extract_skill_handles,
+    export_skills_for_goose,
+    install_skill_repo,
+    read_skill_markdown,
+    render_selected_skill_context,
+    render_skill_catalog,
+)
+from llm_runpod.state import LastLaunch, load_last_launch, save_last_launch
 from llm_runpod.vscode import VSCodeConnection, render_vscode_connection
 
 
@@ -124,6 +134,15 @@ def launch(args: argparse.Namespace) -> None:
         wait_for_openai_ready(base_url, timeout_seconds=args.wait_timeout)
 
     openai_base_url = f"{base_url}/v1"
+    state = LastLaunch(
+        pod_id=pod_id,
+        model=config.model_id,
+        base_url=base_url,
+        openai_base_url=openai_base_url,
+        gpu_id=config.gpu_id,
+        volume_id=volume_id,
+    )
+    save_last_launch(state)
     print(
         json.dumps(
             {
@@ -139,13 +158,223 @@ def launch(args: argparse.Namespace) -> None:
 
 
 def ask(args: argparse.Namespace) -> None:
-    answer = chat(args.base_url, args.model, args.prompt, system=args.system, temperature=args.temperature)
+    if args.prompt.strip() == "@skills":
+        print(render_skill_catalog())
+        return
+
+    selected_skills = render_selected_skill_context(extract_skill_handles(args.prompt))
+    system = args.system
+    if selected_skills:
+        system = f"{system}\n\n{selected_skills}"
+
+    answer = chat(args.base_url, args.model, args.prompt, system=system, temperature=args.temperature)
     print(answer)
 
 
 def vscode(args: argparse.Namespace) -> None:
     connection = VSCodeConnection(base_url=args.base_url, model=args.model, api_key=args.api_key)
     print(render_vscode_connection(connection, args.target))
+
+
+def status(args: argparse.Namespace) -> None:
+    state = load_last_launch()
+    base_url = args.base_url or (state.openai_base_url if state else None)
+    model = args.model or (state.model if state else DEFAULT_MODEL_ID)
+    if not base_url:
+        raise SystemExit("No base URL provided and no .llm-runpod/state.json found.")
+
+    report: dict[str, object] = {
+        "base_url": base_url,
+        "model": model,
+        "models_ok": False,
+        "chat_ok": False,
+    }
+    if state:
+        report["pod_id"] = state.pod_id
+        report["gpu_id"] = state.gpu_id
+        report["cost_per_hour"] = state.cost_per_hour
+
+    models_payload = list_models(base_url)
+    models = [item.get("id") for item in models_payload.get("data", []) if isinstance(item, dict)]
+    report["models_ok"] = True
+    report["served_models"] = models
+    report["model_found"] = model in models
+
+    chat_payload = chat_completion(
+        base_url,
+        model,
+        [{"role": "user", "content": "Reply with exactly: ready"}],
+        max_tokens=32,
+        timeout=args.timeout,
+    )
+    message = chat_payload["choices"][0]["message"]
+    report["chat_ok"] = "ready" in str(message.get("content", "")).lower()
+    report["chat_content"] = message.get("content")
+
+    if args.tools:
+        tool_payload = chat_completion(
+            base_url,
+            model,
+            [{"role": "user", "content": "Use the provided tool to report the word ready."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "report_result",
+                        "description": "Report a short result string",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"result": {"type": "string"}},
+                            "required": ["result"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+            max_tokens=128,
+            timeout=args.timeout,
+        )
+        tool_message = tool_payload["choices"][0]["message"]
+        report["tools_ok"] = bool(tool_message.get("tool_calls"))
+        report["tool_calls"] = tool_message.get("tool_calls")
+
+    print(json.dumps(report, indent=2))
+
+
+def cleanup_pod(args: argparse.Namespace) -> None:
+    state = load_last_launch()
+    pod_id = args.pod_id or (state.pod_id if state else None)
+    if not pod_id:
+        raise SystemExit("No pod id provided and no .llm-runpod/state.json found.")
+    action = "stop" if args.command == "stop" else "remove"
+    result = run_command(["runpodctl", "pod", action, pod_id])
+    print(
+        json.dumps(
+            {
+                "pod_id": pod_id,
+                "action": args.command,
+                "model": state.model if state else None,
+                "cost_per_hour": state.cost_per_hour if state else None,
+                "stdout": result.stdout.strip(),
+            },
+            indent=2,
+        )
+    )
+
+
+def roo_instructions(args: argparse.Namespace) -> None:
+    print(
+        "\n".join(
+            [
+                "Use this project as a self-hosted OpenAI-compatible coding-agent backend.",
+                "",
+                "Behavior:",
+                "- Be concise and action-oriented.",
+                "- Use available tools directly instead of narrating long plans.",
+                "- Read small, relevant file sets before broad repo scans.",
+                "- Prefer concrete edits and verification over extended brainstorming.",
+                "- Emit valid tool calls when tools are available; do not print fake tool JSON.",
+                "- If a request includes `@skills`, list installed skill handles.",
+                "- If a request includes `@skill-name`, treat that as a request to load and follow that skill's instructions.",
+                "",
+                "Recommended Roo settings:",
+                "- API Provider: OpenAI Compatible",
+                "- API Key: unused",
+                "- Context window: match the vLLM `max_model_len` value",
+                "- Max output: 1024 to start",
+                "- Supports images: false unless the served model is actually multimodal",
+                "- Prompt caching: false unless the endpoint explicitly supports it",
+            ]
+        )
+    )
+
+
+def goose(args: argparse.Namespace) -> None:
+    state = load_last_launch()
+    base_url = args.base_url or (state.openai_base_url if state else None)
+    model = args.model or (state.model if state else DEFAULT_MODEL_ID)
+    if not base_url:
+        raise SystemExit("No base URL provided and no .llm-runpod/state.json found.")
+
+    payload = {
+        "purpose": "Configure Goose to use this Runpod vLLM endpoint as an OpenAI-compatible provider.",
+        "provider": {
+            "provider_type": "OpenAI Compatible",
+            "display_name": args.display_name,
+            "api_url": base_url,
+            "api_key": args.api_key,
+            "available_models": [model],
+            "streaming_support": True,
+        },
+        "desktop_steps": [
+            "Open Goose Desktop settings.",
+            "Go to Models / Configure Providers.",
+            "Add a custom provider.",
+            "Choose OpenAI Compatible.",
+            "Use the API URL, API key, and model id from this output.",
+            "If Goose offers an API-key-required toggle, leave it enabled with the dummy key unless your endpoint rejects auth headers.",
+        ],
+        "cli_steps": [
+            "Run `goose configure`.",
+            "Choose Configure Providers.",
+            "Choose a custom/OpenAI-compatible provider if available.",
+            "Use the API URL, API key, and model id from this output.",
+        ],
+        "skills": {
+            "goose_project_skill_dir": ".agents/skills/",
+            "export_command": "llm-runpod skills export --target goose",
+            "list_in_goose": "goose skills list",
+        },
+        "vscode": {
+            "preferred_path": "Use a VS Code ACP client that can launch `goose acp`.",
+            "stdio_command": "goose acp",
+            "server_command": "GOOSE_SERVER__SECRET_KEY='change-me' goose serve",
+            "server_url": "http://127.0.0.1:3284/acp",
+            "fallback": "If no suitable ACP client works, build a small VS Code extension that talks to Goose ACP, or adapt Roo to launch/use Goose as its agent backend.",
+        },
+        "notes": [
+            "Goose is the agent harness; Runpod/vLLM remains the model-serving layer.",
+            "The served model must support tool calls well for Goose to behave like a coding agent.",
+            "For the current Qwen3.8 27B model, keep the vLLM qwen3_coder tool parser and qwen3 reasoning parser.",
+        ],
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def skills_install(args: argparse.Namespace) -> None:
+    skill_repo = install_skill_repo(args.repo_url)
+    print(
+        json.dumps(
+            {
+                "repo": skill_repo.url,
+                "path": skill_repo.path,
+                "commit": skill_repo.commit,
+                "skills": [skill.name for skill in skill_repo.skills],
+            },
+            indent=2,
+        )
+    )
+
+
+def skills_list(args: argparse.Namespace) -> None:
+    if args.handles:
+        print(render_skill_catalog())
+    else:
+        print(json.dumps({"skills": all_skills()}, indent=2))
+
+
+def skills_show(args: argparse.Namespace) -> None:
+    if args.skill == "@skills":
+        print(render_skill_catalog())
+        return
+    print(read_skill_markdown(args.skill))
+
+
+def skills_export(args: argparse.Namespace) -> None:
+    if args.target != "goose":
+        raise SystemExit(f"Unsupported skill export target: {args.target}")
+    exported = export_skills_for_goose()
+    print(json.dumps({"target": "goose", "exported": exported}, indent=2))
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -177,6 +406,50 @@ def main(argv: Sequence[str] | None = None) -> None:
     vscode_parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", "unused"))
     vscode_parser.add_argument("--target", choices=["all", "env", "continue", "cline", "roo"], default="all")
     vscode_parser.set_defaults(func=vscode)
+
+    status_parser = subparsers.add_parser("status", help="Smoke-test an OpenAI-compatible endpoint.")
+    status_parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    status_parser.add_argument("--model", default=os.getenv("LLM_MODEL_ID"))
+    status_parser.add_argument("--timeout", type=int, default=90)
+    status_parser.add_argument("--tools", action="store_true", help="Also test native OpenAI tool calls.")
+    status_parser.set_defaults(func=status)
+
+    stop_parser = subparsers.add_parser("stop", help="Stop the last launched Runpod pod, releasing GPU billing.")
+    stop_parser.add_argument("--pod-id")
+    stop_parser.set_defaults(func=cleanup_pod)
+
+    terminate_parser = subparsers.add_parser("terminate", help="Delete the last launched Runpod pod.")
+    terminate_parser.add_argument("--pod-id")
+    terminate_parser.set_defaults(func=cleanup_pod)
+
+    roo_instructions_parser = subparsers.add_parser("roo-instructions", help="Print recommended Roo custom instructions.")
+    roo_instructions_parser.set_defaults(func=roo_instructions)
+
+    goose_parser = subparsers.add_parser("goose", help="Print Goose setup for this Runpod vLLM endpoint.")
+    goose_parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
+    goose_parser.add_argument("--model", default=os.getenv("LLM_MODEL_ID"))
+    goose_parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", "unused"))
+    goose_parser.add_argument("--display-name", default="Runpod vLLM")
+    goose_parser.set_defaults(func=goose)
+
+    skills_parser = subparsers.add_parser("skills", help="Install and inspect local agent skill repos.")
+    skills_subparsers = skills_parser.add_subparsers(dest="skills_command", required=True)
+
+    skills_install_parser = skills_subparsers.add_parser("install", help="Clone or update a GitHub skill repo.")
+    skills_install_parser.add_argument("repo_url")
+    skills_install_parser.set_defaults(func=skills_install)
+
+    skills_list_parser = skills_subparsers.add_parser("list", help="List skills installed into this repo.")
+    skills_list_parser.add_argument("--handles", action="store_true", help="Print copyable @skill handles for prompting.")
+    skills_list_parser.set_defaults(func=skills_list)
+
+    skills_show_parser = skills_subparsers.add_parser("show", help="Print one selected skill's SKILL.md instructions.")
+    skills_show_parser.add_argument("skill", help="Skill name or @skill handle. Use @skills for the handle catalog.")
+    skills_show_parser.set_defaults(func=skills_show)
+
+    skills_export_parser = skills_subparsers.add_parser("export", help="Export installed skills into another agent's skill layout.")
+    skills_export_parser.add_argument("--target", choices=["goose"], required=True)
+    skills_export_parser.set_defaults(func=skills_export)
 
     args = parser.parse_args(argv)
     args.func(args)
